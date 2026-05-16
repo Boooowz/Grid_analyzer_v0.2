@@ -33,7 +33,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     import openpyxl
@@ -70,6 +70,7 @@ class DetailRow:
     gross_sunday_night_hours: float
     net_sunday_night_hours: float
     sunday_dates: List[date] = field(default_factory=list)
+    holiday_dates: List[date] = field(default_factory=list)
     note: str = ""
 
 
@@ -91,6 +92,7 @@ class EmployeeSummary:
     full_name: str
     work_dates: set = field(default_factory=set)
     sunday_dates: set = field(default_factory=set)
+    holiday_dates: set = field(default_factory=set)
     excluded_leave_dates: set = field(default_factory=set)
     excluded_leave_rows: int = 0
     excluded_non_work_rows: int = 0
@@ -279,12 +281,14 @@ def night_hours(start: datetime, end: datetime) -> float:
     return total
 
 
-def sunday_overlap(start: datetime, end: datetime) -> Tuple[float, List[date]]:
+def sunday_overlap(start: datetime, end: datetime,
+                   holiday_dates: Optional[Set[date]] = None) -> Tuple[float, List[date]]:
+    hd = holiday_dates or set()
     hours = 0.0
     dates: List[date] = []
     for d in iter_dates(start.date(), end.date()):
-        # Python: Monday=0 ... Sunday=6
-        if d.weekday() == 6:
+        # Python: Monday=0 ... Sunday=6. Οι αργίες μετριούνται όπως η Κυριακή.
+        if d.weekday() == 6 or d in hd:
             ss = datetime.combine(d, time(0, 0))
             se = datetime.combine(d + timedelta(days=1), time(0, 0))
             h = overlap_hours(start, end, ss, se)
@@ -294,14 +298,50 @@ def sunday_overlap(start: datetime, end: datetime) -> Tuple[float, List[date]]:
     return hours, dates
 
 
-def sunday_night_hours(start: datetime, end: datetime) -> float:
+def sunday_night_hours(start: datetime, end: datetime,
+                       holiday_dates: Optional[Set[date]] = None) -> float:
+    hd = holiday_dates or set()
     total = 0.0
     for d in iter_dates(start.date(), end.date()):
-        if d.weekday() == 6:
-            # Νυχτερινές ώρες που πέφτουν μέσα στην ημερολογιακή Κυριακή: 00:00-06:00 και 22:00-24:00.
+        if d.weekday() == 6 or d in hd:
+            # Νυχτερινές ώρες μέσα στην Κυριακή/αργία: 00:00-06:00 και 22:00-24:00.
             total += overlap_hours(start, end, datetime.combine(d, time(0, 0)), datetime.combine(d, NIGHT_END))
             total += overlap_hours(start, end, datetime.combine(d, NIGHT_START), datetime.combine(d + timedelta(days=1), time(0, 0)))
     return total
+
+
+def _orthodox_easter(year: int) -> date:
+    # Meeus Julian algorithm + 13 days shift για το Γρηγοριανό (ισχύει 1900-2099).
+    a = year % 4
+    b = year % 7
+    c = year % 19
+    d_ = (19 * c + 15) % 30
+    e = (2 * a + 4 * b - d_ + 34) % 7
+    month = (d_ + e + 114) // 31
+    day = ((d_ + e + 114) % 31) + 1
+    julian = date(year, month, day)
+    return julian + timedelta(days=13)
+
+
+def greek_public_holidays(year: int) -> Dict[date, str]:
+    fixed: Dict[date, str] = {
+        date(year, 1, 1): "Πρωτοχρονιά",
+        date(year, 1, 6): "Θεοφάνεια",
+        date(year, 3, 25): "25η Μαρτίου",
+        date(year, 5, 1): "Πρωτομαγιά",
+        date(year, 8, 15): "Δεκαπενταύγουστος",
+        date(year, 10, 28): "28η Οκτωβρίου",
+        date(year, 12, 25): "Χριστούγεννα",
+        date(year, 12, 26): "Σύναξη Θεοτόκου",
+    }
+    easter = _orthodox_easter(year)
+    movable: Dict[date, str] = {
+        easter - timedelta(days=48): "Καθαρά Δευτέρα",
+        easter - timedelta(days=2): "Μ. Παρασκευή",
+        easter + timedelta(days=1): "Δευτέρα Πάσχα",
+        easter + timedelta(days=50): "Αγίου Πνεύματος",
+    }
+    return {**fixed, **movable}
 
 
 def round_hours(value: float) -> float:
@@ -316,8 +356,17 @@ def leave_note(count: int) -> str:
     return f"Εξαιρέθηκαν {count} γραμμές άδειας. "
 
 
-def analyze_excel(input_path: str | Path) -> Tuple[List[EmployeeSummary], List[DetailRow], List[ExcludedRow], List[str]]:
+def holiday_note(holiday_dates_set) -> str:
+    if not holiday_dates_set:
+        return ""
+    parts = ", ".join(d.strftime("%d/%m") for d in sorted(holiday_dates_set))
+    return f"Αργίες ως Κυριακή: {parts}. "
+
+
+def analyze_excel(input_path: str | Path,
+                  holiday_dates: Optional[Set[date]] = None) -> Tuple[List[EmployeeSummary], List[DetailRow], List[ExcludedRow], List[str]]:
     input_path = Path(input_path)
+    hd = holiday_dates or set()
     wb = load_workbook(input_path, data_only=True)
     ws = wb.active
     headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
@@ -396,8 +445,9 @@ def analyze_excel(input_path: str | Path) -> Tuple[List[EmployeeSummary], List[D
             allocated_break_hours = break_hours_row * (gross / total_gross_row_hours) if total_gross_row_hours else 0.0
 
             gross_nh = night_hours(start_dt, end_dt)
-            gross_sh, sunday_dates = sunday_overlap(start_dt, end_dt)
-            gross_snh = sunday_night_hours(start_dt, end_dt)
+            gross_sh, sunday_dates = sunday_overlap(start_dt, end_dt, hd)
+            gross_snh = sunday_night_hours(start_dt, end_dt, hd)
+            row_holiday_dates = [d for d in sunday_dates if d in hd and d.weekday() != 6]
 
             # Κρατάμε τα πεδία net_* για συμβατότητα με τον υπόλοιπο κώδικα,
             # αλλά πλέον είναι ίσα με τις πραγματικές ώρες ωραρίου, χωρίς αφαίρεση διαλείμματος.
@@ -414,6 +464,7 @@ def analyze_excel(input_path: str | Path) -> Tuple[List[EmployeeSummary], List[D
             summary.sunday_hours += gross_sh
             summary.sunday_night_hours += gross_snh
             summary.sunday_dates.update(sunday_dates)
+            summary.holiday_dates.update(row_holiday_dates)
             summary.work_rows += 1
 
             details.append(DetailRow(
@@ -434,6 +485,7 @@ def analyze_excel(input_path: str | Path) -> Tuple[List[EmployeeSummary], List[D
                 gross_sunday_night_hours=gross_snh,
                 net_sunday_night_hours=net_snh,
                 sunday_dates=sunday_dates,
+                holiday_dates=row_holiday_dates,
             ))
 
     sorted_summaries = sorted(summaries.values(), key=lambda s: (s.last_name, s.first_name, s.afm))
@@ -492,6 +544,7 @@ def write_summary_xlsx(output_path: str | Path, summaries: List[EmployeeSummary]
             s.excluded_leave_rows,
             s.excluded_non_work_rows,
             leave_note(s.excluded_leave_rows)
+            + holiday_note(s.holiday_dates)
             + ("; ".join(s.warnings[:3]) + (" ..." if len(s.warnings) > 3 else "")),
         ])
 
@@ -514,6 +567,7 @@ def write_summary_xlsx(output_path: str | Path, summaries: List[EmployeeSummary]
         "Μικτές νυχτερινές ώρες Κυριακής",
         "Νυχτερινές ώρες Κυριακής",
         "Κυριακές που αφορούνται",
+        "Αργίες που αφορούνται",
     ])
     for d in details:
         detail_ws.append([
@@ -533,7 +587,8 @@ def write_summary_xlsx(output_path: str | Path, summaries: List[EmployeeSummary]
             round_hours(d.net_sunday_hours),
             round_hours(d.gross_sunday_night_hours),
             round_hours(d.net_sunday_night_hours),
-            ", ".join(x.strftime("%d/%m/%Y") for x in d.sunday_dates),
+            ", ".join(x.strftime("%d/%m/%Y") for x in d.sunday_dates if x.weekday() == 6),
+            ", ".join(x.strftime("%d/%m/%Y") for x in d.holiday_dates),
         ])
 
     excluded_ws = wb.create_sheet("Εξαιρούμενες_Γραμμές")
@@ -574,7 +629,8 @@ def write_summary_xlsx(output_path: str | Path, summaries: List[EmployeeSummary]
         ["Κανόνας", "Τι εφαρμόζεται"],
         ["Νυχτερινές ώρες", "22:00 έως 06:00 της επόμενης ημέρας."],
         ["Κυριακή", "Ημερολογιακή Κυριακή 00:00 έως 24:00. Οι βάρδιες που περνούν τα μεσάνυχτα σπάνε χρονικά."],
-        ["Νυχτερινές ώρες Κυριακής", "Μόνο οι ώρες που είναι ταυτόχρονα Κυριακή και νυχτερινές: 00:00-06:00 και 22:00-24:00 της Κυριακής."],
+        ["Αργίες", "Οι επιλεγμένες αργίες υπολογίζονται όπως η Κυριακή (00:00-24:00), στις ίδιες στήλες με την Κυριακή. Καταγράφονται στις Παρατηρήσεις."],
+        ["Νυχτερινές ώρες Κυριακής", "Μόνο οι ώρες που είναι ταυτόχρονα Κυριακή/αργία και νυχτερινές: 00:00-06:00 και 22:00-24:00."],
         ["Ημέρες άδειας", "Γραμμές με ένδειξη άδειας, π.χ. Κανονική άδεια, δεν υπολογίζονται καθόλου σε ημέρες ή ώρες εργασίας, ακόμη κι αν περιέχουν ωράριο."],
         ["Μη εργασία/ρεπό", "Γραμμές όπως ΜΗ ΕΡΓΑΣΙΑ ή ΑΝΑΠΑΥΣΗ/ΡΕΠΟ δεν υπολογίζονται."],
         ["Διάλειμμα", "Το διάλειμμα δεν αφαιρείται από τις ώρες εργασίας. Θεωρείται ότι περιλαμβάνεται στο δηλωμένο ωράριο και εμφανίζεται μόνο ενημερωτικά."],
@@ -659,21 +715,34 @@ def write_summary_csv(output_path: str | Path, summaries: List[EmployeeSummary])
                 len(s.excluded_leave_dates),
                 s.excluded_leave_rows,
                 s.excluded_non_work_rows,
-                leave_note(s.excluded_leave_rows) + "; ".join(s.warnings),
+                leave_note(s.excluded_leave_rows) + holiday_note(s.holiday_dates) + "; ".join(s.warnings),
             ])
 
 
 # ------------------------- GUI -------------------------
+
+GREEK_MONTHS = [
+    "Ιανουάριος", "Φεβρουάριος", "Μάρτιος", "Απρίλιος", "Μάιος", "Ιούνιος",
+    "Ιούλιος", "Αύγουστος", "Σεπτέμβριος", "Οκτώβριος", "Νοέμβριος", "Δεκέμβριος",
+]
+
 
 def launch_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("Σύνοψη εργασίας / Κυριακών / νυχτερινών από Excel")
-    root.geometry("1320x740")
+    root.title("Σύνοψη εργασίας / Κυριακών / νυχτερινών / αργιών από Excel")
+    root.geometry("1320x780")
 
-    state = {"summaries": [], "details": [], "excluded_rows": [], "warnings": [], "input_path": None}
+    today_date = date.today()
+    state = {
+        "summaries": [], "details": [], "excluded_rows": [], "warnings": [],
+        "input_path": None,
+        "holiday_dates": set(),
+        "month": today_date.month,
+        "year": today_date.year,
+    }
 
     top = ttk.Frame(root, padding=10)
     top.pack(fill="x")
@@ -689,6 +758,109 @@ def launch_gui():
 
     btn_frame = ttk.Frame(top)
     btn_frame.pack(fill="x")
+
+    hol_frame = ttk.Frame(top)
+    hol_frame.pack(fill="x", pady=(6, 0))
+
+    ttk.Label(hol_frame, text="Μήνας υπολογισμού:").pack(side="left", padx=(0, 4))
+    month_var = tk.StringVar(value=GREEK_MONTHS[today_date.month - 1])
+    month_cb = ttk.Combobox(hol_frame, values=GREEK_MONTHS, state="readonly", width=14, textvariable=month_var)
+    month_cb.pack(side="left", padx=(0, 8))
+    ttk.Label(hol_frame, text="Έτος:").pack(side="left", padx=(0, 4))
+    year_var = tk.IntVar(value=today_date.year)
+    year_sb = ttk.Spinbox(hol_frame, from_=2000, to=2100, width=6, textvariable=year_var)
+    year_sb.pack(side="left", padx=(0, 8))
+
+    holiday_summary_var = tk.StringVar(value="Καμία αργία επιλεγμένη.")
+
+    def open_holiday_dialog():
+        try:
+            year = int(year_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Σφάλμα", "Μη έγκυρο έτος.")
+            return
+        month = GREEK_MONTHS.index(month_var.get()) + 1
+        state["month"], state["year"] = month, year
+
+        dialog = tk.Toplevel(root)
+        dialog.title(f"Αργίες — {GREEK_MONTHS[month - 1]} {year}")
+        dialog.transient(root)
+        dialog.grab_set()
+        dialog.geometry("420x520")
+
+        ttk.Label(dialog, text=f"Επίσημες αργίες {GREEK_MONTHS[month - 1]} {year}",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+
+        all_hols = greek_public_holidays(year)
+        month_hols = sorted([(d, n) for d, n in all_hols.items() if d.month == month])
+
+        official_vars: List[Tuple[date, tk.BooleanVar]] = []
+        if not month_hols:
+            ttk.Label(dialog, text="Δεν υπάρχουν επίσημες αργίες αυτόν τον μήνα.").pack(anchor="w", padx=12)
+        else:
+            for d, name in month_hols:
+                checked = d in state["holiday_dates"] or not state["holiday_dates"]
+                v = tk.BooleanVar(value=checked)
+                ttk.Checkbutton(dialog, text=f"{d.strftime('%d/%m/%Y')} – {name}", variable=v).pack(anchor="w", padx=20)
+                official_vars.append((d, v))
+
+        ttk.Separator(dialog).pack(fill="x", pady=8, padx=10)
+        ttk.Label(dialog, text="Επιπλέον αργίες (έως 3) — μορφή DD/MM",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12, pady=(0, 4))
+
+        extra_entries: List[tk.Entry] = []
+        existing_extras = sorted([d for d in state["holiday_dates"]
+                                  if d not in {x[0] for x in month_hols}])
+        for i in range(3):
+            row = ttk.Frame(dialog)
+            row.pack(anchor="w", padx=20, pady=2)
+            ttk.Label(row, text=f"Αργία {i + 1}:").pack(side="left", padx=(0, 6))
+            e = ttk.Entry(row, width=10)
+            if i < len(existing_extras):
+                e.insert(0, existing_extras[i].strftime("%d/%m"))
+            e.pack(side="left")
+            extra_entries.append(e)
+
+        msg_var = tk.StringVar(value="")
+        ttk.Label(dialog, textvariable=msg_var, foreground="#c00").pack(anchor="w", padx=12, pady=(6, 0))
+
+        def on_ok():
+            selected: Set[date] = {d for d, v in official_vars if v.get()}
+            for e in extra_entries:
+                txt = e.get().strip()
+                if not txt:
+                    continue
+                m = re.match(r"^\s*(\d{1,2})\s*[/.\-]\s*(\d{1,2})(?:\s*[/.\-]\s*(\d{2,4}))?\s*$", txt)
+                if not m:
+                    msg_var.set(f"Μη έγκυρη ημερομηνία: {txt} (DD/MM ή DD/MM/YYYY).")
+                    return
+                day = int(m.group(1))
+                mon = int(m.group(2))
+                yr = int(m.group(3)) if m.group(3) else year
+                if yr < 100:
+                    yr += 2000
+                try:
+                    selected.add(date(yr, mon, day))
+                except ValueError:
+                    msg_var.set(f"Μη έγκυρη ημερομηνία: {txt}.")
+                    return
+            state["holiday_dates"] = selected
+            if selected:
+                holiday_summary_var.set(
+                    f"Αργίες ({len(selected)}): " +
+                    ", ".join(d.strftime("%d/%m/%Y") for d in sorted(selected))
+                )
+            else:
+                holiday_summary_var.set("Καμία αργία επιλεγμένη.")
+            dialog.destroy()
+
+        btns = ttk.Frame(dialog)
+        btns.pack(side="bottom", fill="x", pady=10)
+        ttk.Button(btns, text="OK", command=on_ok).pack(side="right", padx=10)
+        ttk.Button(btns, text="Άκυρο", command=dialog.destroy).pack(side="right")
+
+    ttk.Button(hol_frame, text="Αργίες μήνα...", command=open_holiday_dialog).pack(side="left", padx=(0, 8))
+    ttk.Label(hol_frame, textvariable=holiday_summary_var, foreground="#1F4E78").pack(side="left")
 
     status_var = tk.StringVar(value="Δεν έχει φορτωθεί αρχείο.")
 
@@ -728,6 +900,7 @@ def launch_gui():
                 s.excluded_leave_rows,
                 s.excluded_non_work_rows,
                 leave_note(s.excluded_leave_rows)
+                + holiday_note(s.holiday_dates)
                 + ("; ".join(s.warnings[:2]) + (" ..." if len(s.warnings) > 2 else "")),
             ))
         status_var.set(
@@ -742,7 +915,7 @@ def launch_gui():
         if not path:
             return
         try:
-            summaries, details, excluded_rows, warnings = analyze_excel(path)
+            summaries, details, excluded_rows, warnings = analyze_excel(path, holiday_dates=state["holiday_dates"])
             state["summaries"] = summaries
             state["details"] = details
             state["excluded_rows"] = excluded_rows
@@ -825,6 +998,69 @@ def launch_streamlit_app():
         "σύνοψη ανά εργαζόμενο. Το διάλειμμα δεν αφαιρείται από τις ώρες."
     )
 
+    today_d = date.today()
+
+    st.subheader("Μήνας υπολογισμού & αργίες")
+    col_m, col_y = st.columns([2, 1])
+    month = col_m.selectbox(
+        "Μήνας υπολογισμού",
+        list(range(1, 13)),
+        format_func=lambda m: GREEK_MONTHS[m - 1],
+        index=today_d.month - 1,
+        key="calc_month",
+    )
+    year = col_y.number_input(
+        "Έτος",
+        min_value=2000, max_value=2100,
+        value=today_d.year, step=1,
+        key="calc_year",
+    )
+    year = int(year)
+
+    all_hols = greek_public_holidays(year)
+    month_hols = sorted([(d, n) for d, n in all_hols.items() if d.month == month])
+
+    selected_official: Set[date] = set()
+    with st.expander(
+        f"Αργίες {GREEK_MONTHS[month - 1]} {year}",
+        expanded=bool(month_hols),
+    ):
+        if not month_hols:
+            st.caption("Δεν υπάρχουν επίσημες ελληνικές αργίες αυτόν τον μήνα.")
+        else:
+            st.caption(
+                "Οι επιλεγμένες αργίες μετριούνται όπως η Κυριακή (00:00–24:00) "
+                "και προστίθενται στις ώρες Κυριακής."
+            )
+            for d, name in month_hols:
+                if st.checkbox(
+                    f"{d.strftime('%d/%m/%Y')} – {name}",
+                    value=True,
+                    key=f"hol_off_{d.isoformat()}",
+                ):
+                    selected_official.add(d)
+
+    extra: Set[date] = set()
+    with st.expander("Προσθήκη επιπλέον αργίας (έως 3)", expanded=False):
+        st.caption("Άφησέ τα κενά αν δεν χρειάζονται. Δέχεται οποιαδήποτε ημερομηνία.")
+        ec1, ec2, ec3 = st.columns(3)
+        for i, col in enumerate((ec1, ec2, ec3), start=1):
+            v = col.date_input(
+                f"Αργία {i}",
+                value=None,
+                key=f"extra_hol_{i}",
+                format="DD/MM/YYYY",
+            )
+            if v:
+                extra.add(v)
+
+    holiday_dates: Set[date] = selected_official | extra
+    if holiday_dates:
+        st.info(
+            "Επιλεγμένες αργίες: " +
+            ", ".join(d.strftime("%d/%m/%Y") for d in sorted(holiday_dates))
+        )
+
     uploaded = st.file_uploader("Αρχείο Excel (.xlsx)", type=["xlsx"])
 
     if uploaded is None:
@@ -837,7 +1073,7 @@ def launch_streamlit_app():
             input_path = tmpdir_path / uploaded.name
             input_path.write_bytes(uploaded.getvalue())
 
-            summaries, details, excluded_rows, warnings = analyze_excel(input_path)
+            summaries, details, excluded_rows, warnings = analyze_excel(input_path, holiday_dates=holiday_dates)
             output_path = tmpdir_path / f"summary_{Path(uploaded.name).stem}.xlsx"
             write_summary_xlsx(output_path, summaries, details, excluded_rows, warnings)
             output_bytes = output_path.read_bytes()
@@ -872,9 +1108,10 @@ def launch_streamlit_app():
                 "Ημέρες εργασίας": len(s.work_dates),
                 "Ώρες εργασίας": round_hours(s.total_hours),
                 "Νυχτερινές ώρες": round_hours(s.night_hours),
-                "Ημέρες εργασίας Κυριακής": len(s.sunday_dates),
-                "Ώρες Κυριακής": round_hours(s.sunday_hours),
-                "Νυχτερινές ώρες Κυριακής": round_hours(s.sunday_night_hours),
+                "Ημέρες Κυριακής/αργίας": len(s.sunday_dates),
+                "Ώρες Κυριακής/αργίας": round_hours(s.sunday_hours),
+                "Νυχτερινές Κυριακής/αργίας": round_hours(s.sunday_night_hours),
+                "Αργίες": ", ".join(d.strftime("%d/%m") for d in sorted(s.holiday_dates)),
                 "Γραμμές άδειας που εξαιρέθηκαν": s.excluded_leave_rows,
                 "Γραμμές μη εργασίας/ρεπό": s.excluded_non_work_rows,
             })
@@ -895,6 +1132,7 @@ def launch_streamlit_app():
             st.write("• Το διάλειμμα δεν αφαιρείται από τις ώρες εργασίας.")
             st.write("• Τα νυχτερινά υπολογίζονται στο διάστημα 22:00–06:00.")
             st.write("• Η Κυριακή υπολογίζεται ημερολογιακά, από 00:00 έως 24:00.")
+            st.write("• Οι επιλεγμένες αργίες υπολογίζονται όπως η Κυριακή και προστίθενται στις ίδιες στήλες.")
 
         if warnings:
             with st.expander("Προειδοποιήσεις ανάγνωσης"):
